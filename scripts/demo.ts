@@ -1,0 +1,26 @@
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { App } from '../src/app.ts';
+import { restrictDemo } from './demo-policy.ts';
+import { serveHttp } from '../src/server.ts';
+const temp=mkdtempSync(join(tmpdir(),'wimzo-demo-'));
+const root=join(temp,'reading-list'); mkdirSync(join(root,'spec'),{recursive:true});
+writeFileSync(join(root,'spec/PRD.md'),'# Reading list\n\nSave articles, tag them and mark them as read.\n\n## Acceptance\n\n- Saved articles appear in the list.\n- Tags can be used to filter articles.\n');
+for (const args of [['init','-q'],['config','user.name','Wimzo demo'],['config','user.email','demo@example.invalid'],['config','commit.gpgsign','false'],['add','.'],['commit','-qm','Synthetic demo requirements']]) execFileSync('git',args,{cwd:root,stdio:'ignore'});
+const app=new App(join(temp,'state'));
+const owner={role:'owner' as const,id:'demo-owner'};
+await app.call('project.register',{id:'demo',name:'Reading list demo',root,purpose:'Synthetic example only',canonicalPaths:['spec/PRD.md']},owner);
+await app.call('spec.capture',{projectId:'demo',path:'spec/PRD.md'},owner);
+await app.call('board.idea',{projectId:'demo',title:'Filter articles by tag',description:'Let readers find their saved articles by topic.',submissionId:'demo-filter'},owner);
+// The demo never dispatches background work or inference.
+restrictDemo(app);
+const server=serveHttp(app,0,true);
+await new Promise<void>((resolve,reject)=>{server.once('listening',resolve);server.once('error',reject);});
+const address=server.address();
+const key=Object.entries(app.tokens()).find(([,actor])=>actor.role==='owner')![0];
+if(address&&typeof address==='object') console.log(`Demo (private local link): http://127.0.0.1:${address.port}/#key=${key}`);
+console.log('Synthetic temporary state. No agent dispatch. Stop with Ctrl+C.');
+await new Promise<void>(resolve=>{server.once('close',resolve);process.once('SIGINT',()=>server.close());process.once('SIGTERM',()=>server.close());});
+await app.close();

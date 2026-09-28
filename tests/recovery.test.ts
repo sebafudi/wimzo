@@ -1,0 +1,78 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,existsSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {execFileSync,spawn,spawnSync} from 'node:child_process';
+import {Store} from '../src/store.ts';
+import {createBackup,restoreBackup,activate,rollback,inspectRecovery} from '../scripts/recover.mjs';
+
+test('real SQLite backup restores pending work paused and rejects corrupt snapshots',async()=>{
+  const temp=mkdtempSync(join(tmpdir(),'wimzo-backup-')),state=join(temp,'state');mkdirSync(state);
+  writeFileSync(join(state,'clients.json'),JSON.stringify({old:{role:'owner',id:'old-owner'}}),{mode:0o600});
+  let store=new Store(join(state,'state.sqlite'));
+  store.put('task',{id:'pending',projectId:'fixture',state:'Running',scope:'fixture',runId:'active-run'});
+  store.put('run',{id:'active-run',taskId:'pending',projectId:'fixture',state:'Running',status:'running',launchState:'launched',pid:12345,childPid:12346,processGroupId:12345,paths:{stdout:'/fixture/stdout.log'}});
+  const snapshot=await createBackup(state,join(temp,'snapshot'));
+  assert.equal(existsSync(join(snapshot.backup,'clients.json')),false);
+  writeFileSync(join(state,'clients.json'),JSON.stringify({current:{role:'owner',id:'current-owner'}}),{mode:0o600});
+  store.put('task',{id:'later',state:'Needs approval'});
+  const live=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+  store.put('run',{id:'current-live-run',state:'Running',status:'running',processGroupId:live.pid});store.close();
+  await assert.rejects(restoreBackup(state,snapshot.backup),/active run processes/);
+  process.kill(-live.pid!,'SIGTERM');await new Promise(resolve=>live.once('exit',resolve));
+  const restored=await restoreBackup(state,snapshot.backup);assert.equal(restored.restored,true);
+  assert.deepEqual(JSON.parse(readFileSync(join(state,'clients.json'),'utf8')),{current:{role:'owner',id:'current-owner'}});
+  store=new Store(join(state,'state.sqlite'));
+  const pending=store.require('task','pending');assert.equal(pending.state,'Paused');assert.equal(pending.runId,undefined);assert.equal(pending.restoredRunId,'active-run');
+  const run=store.require('run','active-run');assert.equal(run.status,'paused');assert.equal(run.state,'Paused');assert.equal(run.launchState,'restored-outcome-unknown');assert.equal(run.pid,undefined);assert.equal(run.processGroupId,undefined);
+  assert.ok(store.list('checkpoint').some(item=>item.taskId==='pending'&&item.runId==='active-run'));assert.equal(store.get('task','later'),undefined);store.close();
+  writeFileSync(join(snapshot.backup,'state.sqlite'),'corrupt');
+  await assert.rejects(restoreBackup(state,snapshot.backup),/checksum/);
+  store=new Store(join(state,'state.sqlite'));assert.equal(store.require('task','pending').state,'Paused');store.close();
+  rmSync(temp,{recursive:true,force:true});
+});
+
+test('activation needs exact owner-reviewed release and standalone rollback survives broken candidate',async()=>{
+  const temp=mkdtempSync(join(tmpdir(),'wimzo-update-')),state=join(temp,'state'),candidate=join(temp,'candidate'),known=join(temp,'known');
+  mkdirSync(join(candidate,'src'),{recursive:true});mkdirSync(join(known,'src'),{recursive:true});mkdirSync(state);
+  writeFileSync(join(candidate,'src/cli.ts'),'throw new Error("fixture startup failure");\n');
+  writeFileSync(join(known,'src/cli.ts'),'console.log("known good fixture");\n');
+  const git=(args:string[])=>execFileSync('git',['-c','commit.gpgsign=false',...args],{cwd:candidate,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+  git(['init','-b','codex/update-fixture']);git(['add','src/cli.ts']);git(['-c','user.name=Fixture','-c','user.email=fixture@localhost','commit','-m','Fixture update candidate']);const revision=git(['rev-parse','HEAD']);
+  let store=new Store(join(state,'state.sqlite'));
+  store.put('project',{id:'wimzo',name:'Wimzo',root:known});
+  store.put('task',{id:'update-fixture',projectId:'wimzo',state:'Needs result review',candidate:{id:revision,specHash:'fixture'},dimensions:{verified:true}});store.close();
+  await assert.rejects(activate(state,candidate,'update-fixture'),/owner accepted/);
+  store=new Store(join(state,'state.sqlite'));store.put('task',{...store.require('task','update-fixture'),state:'Accepted'});store.close();
+  await assert.rejects(activate(state,candidate,'update-fixture'),/Latest exact local activation release decision/);
+  store=new Store(join(state,'state.sqlite'));store.put('release',{id:'fixture-release',taskId:'update-fixture',decision:'approve',candidate:{specHash:'fixture',id:revision},actor:{id:'isolated fixture owner'}});store.close();
+  store=new Store(join(state,'state.sqlite'));store.put('release',{id:'fixture-revocation',taskId:'update-fixture',decision:'reject',candidate:{specHash:'fixture',id:revision},actor:{id:'isolated fixture owner'}});store.close();
+  await assert.rejects(activate(state,candidate,'update-fixture'),/Latest exact local activation release decision/);
+  store=new Store(join(state,'state.sqlite'));store.put('release',{id:'fixture-final-approval',taskId:'update-fixture',decision:'approve',candidate:{specHash:'fixture',id:revision},actor:{id:'isolated fixture owner'}});store.close();
+  const active=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+  await new Promise<void>((resolve,reject)=>{active.once('spawn',resolve);active.once('error',reject);});
+  store=new Store(join(state,'state.sqlite'));store.put('run',{id:'activation-blocker',state:'Running',status:'running',processGroupId:active.pid});store.close();
+  await assert.rejects(activate(state,candidate,'update-fixture'),/active run processes before activation/);
+  process.kill(-active.pid!,'SIGTERM');await new Promise(resolve=>active.once('exit',resolve));
+  await activate(state,candidate,'update-fixture');
+  assert.throws(()=>execFileSync(process.execPath,[join(candidate,'src/cli.ts')],{stdio:'pipe'}),/Command failed/);
+  const result=rollback(state);assert.equal(result.current,known);
+  assert.match(execFileSync(process.execPath,[join(known,'src/cli.ts')],{encoding:'utf8'}),/known good fixture/);
+  assert.equal(JSON.parse(readFileSync(join(state,'active.json'),'utf8')).current,known);
+  rmSync(temp,{recursive:true,force:true});
+});
+
+test('stable launcher reports a recoverable candidate start failure',()=>{
+  const temp=mkdtempSync(join(tmpdir(),'wimzo-launcher-')),state=join(temp,'state'),known=join(temp,'known');
+  mkdirSync(join(known,'src'),{recursive:true});mkdirSync(state);
+  writeFileSync(join(known,'src/cli.ts'),'console.log("known good fixture");\n');
+  writeFileSync(join(state,'active.json'),JSON.stringify({current:join(temp,'missing-candidate'),previous:known}),{mode:0o600});
+  const result=spawnSync(process.execPath,[join(import.meta.dirname,'../scripts/wimzo.mjs'),'status'],{env:{...process.env,WIMZO_STATE_DIR:state},encoding:'utf8'});
+  assert.notEqual(result.status,0);assert.match(result.stderr,/Candidate failed/);assert.match(result.stderr,/recover\.mjs.*rollback/);
+  writeFileSync(join(state,'active.json'),'{broken',{mode:0o600});
+  const malformed=spawnSync(process.execPath,[join(import.meta.dirname,'../scripts/wimzo.mjs'),'status'],{env:{...process.env,WIMZO_STATE_DIR:state},encoding:'utf8'});
+  assert.notEqual(malformed.status,0);assert.match(malformed.stderr,/Activation pointer is invalid/);assert.match(malformed.stderr,/recover\.mjs.*inspect/);
+  const inspection=inspectRecovery(state);assert.equal(inspection.active,null);assert.ok(inspection.activeError);assert.match(inspection.activeError.error,/invalid/);assert.equal(inspection.activeError.path,join(state,'active.json'));assert.match(inspection.activeError.repair,/validated backup/);
+  rmSync(temp,{recursive:true,force:true});
+});

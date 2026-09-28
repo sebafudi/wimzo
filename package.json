@@ -1,0 +1,36 @@
+{
+  "name": "wimzo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node scripts/wimzo.mjs serve --dashboard",
+    "cli": "node src/cli.ts",
+    "test": "node --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "setup": "node scripts/setup.ts",
+    "demo": "node scripts/demo.ts",
+    "stop": "node scripts/wimzo.mjs stop",
+    "doctor": "node scripts/wimzo.mjs doctor",
+    "dashboard": "node scripts/wimzo.mjs dashboard"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.4",
+    "linkedom": "0.18.12",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.280",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@openai/codex-sdk": "0.155.1",
+    "marked": "17.0.4"
+  },
+  "overrides": {
+    "undici": "^8.9.0",
+    "brace-expansion": "^5.0.9",
+    "protobufjs": "^7.6.5"
+  }
+}
